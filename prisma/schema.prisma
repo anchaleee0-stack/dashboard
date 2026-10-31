@@ -1,0 +1,258 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// ENUMS (คำนำหน้า, สิทธิ์ผู้ใช้งาน, สถานะ State Machine)
+// ==========================================
+
+enum NamePrefix {
+  MR   // นาย
+  MRS  // นาง
+  MS   // นางสาว
+}
+
+enum UserRole {
+  REQUESTER          // Role 1: ผู้ยื่นคำขอ (บุคลากร / ครู)
+  ROOM_INSPECTOR     // Role 2: เจ้าหน้าที่ผู้ตรวจสอบห้อง (งานศูนย์ดิจิทัลและสื่อสารองค์กร)
+  DEPARTMENT_HEAD    // Role 3: หัวหน้างาน/ผู้รับรอง (หัวหน้างานศูนย์ดิจิทัลและสื่อสารองค์กร)
+  EXECUTIVE_APPROVER // Role 4: ผู้พิจารณาอนุมัติ (รองผู้อำนวยการฝ่ายพัฒนายุทธศาสตร์และแผนงาน)
+  ADMIN              // ผู้ดูแลระบบ
+}
+
+enum BookingStatus {
+  PENDING_INSPECTION  // 1. รอเจ้าหน้าที่ตรวจสอบความพร้อมห้องและอุปกรณ์
+  INSPECTED_READY     // 2. ตรวจสอบแล้ว (พร้อมใช้งาน) -> รอหัวหน้างานรับรอง
+  INSPECTED_NOT_READY // 2b. ตรวจสอบแล้ว (ไม่พร้อมใช้งาน พร้อมระบุเหตุผล)
+  ENDORSED            // 3. หัวหน้างานลงนามรับรองแล้ว -> รอรองผู้อำนวยการอนุมัติ
+  APPROVED            // 4. อนุมัติแล้ว (Confirmed บนปฏิทินหลักและพร้อมพิมพ์ใบคำขอ A4)
+  REJECTED            // ไม่อนุมัติ
+  CANCELLED           // ยกเลิกคำขอโดยผู้ยื่น
+}
+
+enum InspectionReadiness {
+  READY     // พร้อมใช้งาน
+  NOT_READY // ไม่พร้อมใช้งาน
+}
+
+enum ApprovalStep {
+  ROOM_INSPECTION    // ขั้นที่ 1: เจ้าหน้าที่ตรวจสอบห้อง (Role 2)
+  HEAD_ENDORSEMENT   // ขั้นที่ 2: หัวหน้างานรับรองคำขอ (Role 3)
+  EXECUTIVE_DECISION // ขั้นที่ 3: รองผู้อำนวยการพิจารณาอนุมัติ (Role 4)
+}
+
+enum ApprovalDecision {
+  PENDING
+  READY
+  NOT_READY
+  ENDORSED
+  APPROVED
+  REJECTED
+}
+
+enum NotificationType {
+  BOOKING_CREATED
+  WORKFLOW_UPDATED
+  BOOKING_APPROVED
+  BOOKING_REJECTED
+  BOOKING_CANCELLED
+  MEETING_REMINDER
+}
+
+// ==========================================
+// 1. ตารางผู้ใช้งาน (Users)
+// ==========================================
+model User {
+  id           String         @id @default(cuid())
+  email        String         @unique
+  prefix       NamePrefix     @default(MR)
+  name         String         // ชื่อ-นามสกุล
+  position     String         // ตำแหน่ง เช่น ครูชำนาญการ, เจ้าหน้าที่ฯ
+  department   String         // หน่วยงาน / สาขาวิชา
+  phone        String?        // หมายเลขโทรศัพท์
+  role         UserRole       @default(REQUESTER)
+  signatureUrl String?        // ลายเซ็นดิจิทัลประจำตัว (Base64 / URL)
+  avatarUrl    String?
+
+  bookings      Booking[]
+  approvals     Approval[]
+  notifications Notification[]
+
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  @@index([role])
+}
+
+// ==========================================
+// 2. ตารางห้องประชุม (Rooms)
+// ==========================================
+model Room {
+  id           String        @id @default(cuid())
+  code         String        @unique // เช่น ADIREKSARN, SAKTHONG, DIRECTOR_OFFICE, COFFEE, DOME, COMPUTER_AV, OTHER
+  name         String        @unique
+  capacity     Int           // ความจุจำนวนคนสูงสุด
+  floor        String        // ชั้น/ตำแหน่งที่ตั้ง
+  building     String?       // อาคาร
+  amenities    String[]      // อุปกรณ์มาตรฐานประจำห้อง
+  colorCode    String        @default("#06B6D4")
+  isCustomRoom Boolean       @default(false) // true สำหรับตัวเลือก "อื่น ๆ (ระบุข้อความเพิ่มเติม)"
+  isActive     Boolean       @default(true)
+
+  primaryBookings Booking[]     @relation("PrimaryRoom")
+  bookingRooms    BookingRoom[]
+
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([isActive])
+}
+
+// ==========================================
+// 3. ตารางครุภัณฑ์ / อุปกรณ์ / สิ่งอำนวยความสะดวก (Amenities)
+// ==========================================
+model Amenity {
+  id                 String           @id @default(cuid())
+  code               String           @unique // PROJECTOR, SOUND, MIC, AIRCON, INTERNET, EXTRA_CHAIRS, OTHER
+  name               String           @unique
+  requiresQuantity   Boolean          @default(false) // true สำหรับ "โต๊ะ/เก้าอี้เพิ่มเติม (ระบุจำนวนตัว)"
+  requiresCustomText Boolean          @default(false) // true สำหรับ "อื่น ๆ (ระบุข้อความ)"
+  sortOrder          Int              @default(0)
+  isActive           Boolean          @default(true)
+
+  bookingAmenities   BookingAmenity[]
+
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+}
+
+// ==========================================
+// 4. ตารางคำขอจองห้องประชุม (Bookings)
+// ==========================================
+model Booking {
+  id                  String        @id @default(cuid())
+  documentNo          String        @unique // เลขที่ใบคำขอ เช่น TL-2569-0001
+
+  // ข้อมูลผู้ขอใช้งาน ณ วันที่ยื่นคำขอ (Snapshot ตามแบบฟอร์มเอกสารราชการ)
+  requesterPrefix     NamePrefix
+  requesterName       String        // ชื่อ-นามสกุล (ไม่รวมคำนำหน้า หรือเก็บแยกชัดเจน)
+  requesterPosition   String        // ตำแหน่ง
+  requesterDepartment String        // หน่วยงาน / สาขาวิชา
+  requesterPhone      String        // หมายเลขโทรศัพท์
+
+  // รายละเอียดการใช้งาน
+  title               String        // วัตถุประสงค์ / เพื่อใช้ในการดำเนินงานเรื่อง
+  description         String?       // รายละเอียดเพิ่มเติม
+  startTime           DateTime      @db.Timestamptz(3)
+  endTime             DateTime      @db.Timestamptz(3)
+  attendeeCount       Int           @default(1)
+  customRoomNote      String?       // ข้อความระบุห้องเพิ่มเติม กรณีเลือก "อื่น ๆ"
+
+  // ข้อกำหนดและเงื่อนไข
+  termsAccepted       Boolean       @default(true)
+  termsAcceptedAt     DateTime      @default(now())
+
+  // สถานะใน Workflow State Machine
+  status              BookingStatus @default(PENDING_INSPECTION)
+  reminderSent        Boolean       @default(false)
+
+  // ความสัมพันธ์หลัก (Primary Room & Requester)
+  roomId              String
+  room                Room          @relation("PrimaryRoom", fields: [roomId], references: [id], onDelete: Restrict)
+
+  userId              String
+  user                User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // ความสัมพันธ์แบบ Many-to-Many (รองรับการจอง Single & Multiple Rooms + Amenities)
+  bookingRooms        BookingRoom[]
+  bookingAmenities    BookingAmenity[]
+
+  // ประวัติการตรวจสอบ รับรอง และอนุมัติตามสายบังคับบัญชา
+  approvals           Approval[]
+  notifications       Notification[]
+
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  // Composite Indexes สำหรับการทำ Conflict Detection & Calendar Query ความเร็วสูง
+  @@index([roomId, status, startTime, endTime])
+  @@index([status, startTime, endTime])
+  @@index([startTime, endTime])
+  @@index([userId, createdAt])
+}
+
+// ตารางเชื่อม Booking <-> Room (รองรับ Single / Multiple Select)
+model BookingRoom {
+  id              String   @id @default(cuid())
+  bookingId       String
+  booking         Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  roomId          String
+  room            Room     @relation(fields: [roomId], references: [id], onDelete: Restrict)
+  customRoomLabel String?  // ระบุชื่อสถานที่เมื่อเลือก "อื่น ๆ"
+
+  @@unique([bookingId, roomId])
+  @@index([roomId])
+}
+
+// ตารางเชื่อม Booking <-> Amenity (พร้อมจำนวนตัวและข้อความระบุเพิ่มเติม)
+model BookingAmenity {
+  id         String   @id @default(cuid())
+  bookingId  String
+  booking    Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  amenityId  String
+  amenity    Amenity  @relation(fields: [amenityId], references: [id], onDelete: Restrict)
+  quantity   Int?     // จำนวนตัว (สำหรับ โต๊ะ/เก้าอี้เพิ่มเติม)
+  customNote String?  // ข้อความระบุอุปกรณ์ (สำหรับ อื่น ๆ)
+
+  @@unique([bookingId, amenityId])
+}
+
+// ==========================================
+// 5. ตารางลำดับขั้นการตรวจสอบและอนุมัติ (Approvals)
+// ==========================================
+model Approval {
+  id              String               @id @default(cuid())
+  bookingId       String
+  booking         Booking              @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  step            ApprovalStep         // ROOM_INSPECTION -> HEAD_ENDORSEMENT -> EXECUTIVE_DECISION
+  approverRole    UserRole             // สิทธิ์ผู้ดำเนินการในขั้นตอนนี้
+  approverId      String
+  approver        User                 @relation(fields: [approverId], references: [id], onDelete: Restrict)
+
+  decision        ApprovalDecision     // READY, NOT_READY, ENDORSED, APPROVED, REJECTED
+  readinessStatus InspectionReadiness? // เฉพาะขั้นตรวจสอบห้อง: READY (พร้อมใช้งาน) / NOT_READY (ไม่พร้อมใช้งาน)
+  remarks         String?              // เหตุผลกรณีไม่พร้อมใช้งาน หรือหมายเหตุจากผู้บริหาร
+  signatureData   String?              // ลายเซ็นดิจิทัล (Base64 Canvas / Digital Stamp Text)
+  actedAt         DateTime             @default(now())
+
+  @@unique([bookingId, step])
+  @@index([bookingId, actedAt])
+  @@index([approverRole, decision])
+}
+
+// ==========================================
+// 6. ตารางการแจ้งเตือน (Notifications)
+// ==========================================
+model Notification {
+  id        String           @id @default(cuid())
+  type      NotificationType
+  message   String
+  isRead    Boolean          @default(false)
+
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  bookingId String?
+  booking   Booking?         @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime         @default(now())
+
+  @@index([userId, isRead, createdAt])
+}
